@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bookworm</title>
+<link rel="icon" type="image/svg+xml" href="static/favicon.svg">
+<link rel="alternate icon" type="image/x-icon" href="static/favicon.ico">
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; background: #1a1a1a; color: #e0e0e0; }
+  h1 { margin-bottom: 4px; }
+  form { margin: 20px 0; }
+  input[type=text] { padding: 8px 12px; width: 300px; font-size: 16px; border: 1px solid #444; border-radius: 4px; background: #2a2a2a; color: #e0e0e0; }
+  input[type=text]::placeholder { color: #666; }
+  .search-wrap { display: inline-flex; align-items: center; position: relative; }
+  .clear-btn { position: absolute; right: 8px; background: none; border: none; font-size: 16px; color: #666; cursor: pointer; padding: 0; line-height: 1; display: none; }
+  .clear-btn:hover { color: #ccc; }
+  button[type=submit] { padding: 8px 16px; font-size: 16px; cursor: pointer; border: 1px solid #555; border-radius: 4px; background: #2a2a2a; color: #e0e0e0; margin-left: 6px; }
+  button[type=submit]:hover { background: #333; }
+  .card { display: flex; gap: 14px; padding: 12px; margin-bottom: 12px; background: #242424; border: 1px solid #333; border-radius: 6px; }
+  .card img { width: 80px; height: auto; object-fit: contain; flex-shrink: 0; }
+  .card-body { flex: 1; }
+  .card-body h3 { margin: 0 0 4px; }
+  .card-body h3 a { color: #4caf82; text-decoration: none; }
+  .card-body h3 a:hover { text-decoration: underline; }
+  .card-body p { margin: 2px 0; color: #999; }
+  .toggle-btn { background: none; border: none; color: #4caf82; cursor: pointer; padding: 4px 0; font-size: 14px; }
+  .toggle-btn:hover { text-decoration: underline; }
+  .related-box { margin: 8px 0 0 94px; }
+  .related-box .mini { display: flex; gap: 10px; align-items: center; padding: 6px 0; border-top: 1px solid #333; }
+  .related-box .mini img { width: 40px; height: auto; }
+  .related-box .mini a { color: #4caf82; text-decoration: none; font-size: 14px; }
+  .related-box .mini a:hover { text-decoration: underline; }
+  .no-results { color: #666; margin-top: 20px; }
+  .spinner { color: #666; margin-top: 20px; }
+  .autocomplete-dropdown { position: absolute; top: 100%; left: 0; width: 340px; background: #2a2a2a; border: 1px solid #444; border-top: none; border-radius: 0 0 4px 4px; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
+  .autocomplete-dropdown .ac-item { padding: 8px 12px; cursor: pointer; border-bottom: 1px solid #333; }
+  .autocomplete-dropdown .ac-item:last-child { border-bottom: none; }
+  .autocomplete-dropdown .ac-item:hover, .autocomplete-dropdown .ac-item.selected { background: #1e3a2f; }
+  .autocomplete-dropdown .ac-title { font-size: 14px; font-weight: 500; color: #e0e0e0; }
+  .autocomplete-dropdown .ac-author { font-size: 12px; color: #888; margin-top: 1px; }
+</style>
+</head>
+<body>
+<h1>🐛 Bookworm</h1>
+<form id="searchForm">
+  <div class="search-wrap">
+    <input type="text" name="q" id="searchInput" placeholder="Title, author, or ISBN" autocomplete="off">
+    <button type="button" class="clear-btn" id="clearBtn" title="Clear">&#x2715;</button>
+    <div class="autocomplete-dropdown" id="acDropdown" style="display:none;"></div>
+  </div>
+  <button type="submit">Search</button>
+</form>
+<div id="results"></div>
+
+<script>
+const OL_SEARCH  = 'https://openlibrary.org/search.json';
+const OL_COVER   = 'https://covers.openlibrary.org/b/id/{id}-M.jpg';
+const OL_SUBJECT = 'https://openlibrary.org/subjects/{slug}.json?limit=10';
+const SKIP_SUBJ  = new Set(['fiction','english','juvenile fiction','nonfiction','non-fiction']);
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── URL state ──
+function getQuery() {
+  return new URLSearchParams(location.search).get('q') || '';
+}
+function setQuery(q) {
+  const url = q ? '?q=' + encodeURIComponent(q) : location.pathname;
+  history.pushState({q}, '', url);
+}
+
+// ── Open Library search ──
+async function olSearch(q, limit=10) {
+  const params = new URLSearchParams({
+    q, limit,
+    fields: 'key,title,author_name,cover_i,first_publish_year,ratings_average,ratings_count'
+  });
+  const r = await fetch(OL_SEARCH + '?' + params);
+  if (!r.ok) throw new Error('Search failed');
+  const data = await r.json();
+  return (data.docs || []).map(doc => {
+    const rating = doc.ratings_average
+      ? doc.ratings_average.toFixed(1) + ' (' + (doc.ratings_count || 0).toLocaleString() + ' ratings)'
+      : '';
+    return {
+      title:  doc.title || 'Unknown',
+      author: (doc.author_name || [])[0] || 'Unknown',
+      cover:  doc.cover_i ? OL_COVER.replace('{id}', doc.cover_i) : '',
+      url:    doc.key ? 'https://openlibrary.org' + doc.key : '',
+      year:   doc.first_publish_year || '',
+      rating,
+    };
+  });
+}
+
+// ── Related books ──
+async function getRelated(title, author) {
+  const q = (title + ' ' + author).trim();
+  const params = new URLSearchParams({ q, fields: 'key,title,subject,author_name,cover_i', limit: 1 });
+  const r = await fetch(OL_SEARCH + '?' + params);
+  if (!r.ok) return [];
+  const data = await r.json();
+  const docs = data.docs || [];
+  if (!docs.length) return [];
+
+  const subjects = docs[0].subject || [];
+  const chosen = subjects.find(s => !SKIP_SUBJ.has(s.toLowerCase()) && s.length > 3);
+  if (!chosen) return [];
+
+  const slug = chosen.toLowerCase().replace(/\s+/g,'_').replace(/[,'']/g,'');
+  const r2 = await fetch(OL_SUBJECT.replace('{slug}', slug));
+  if (!r2.ok) return [];
+  const works = (await r2.json()).works || [];
+
+  const seen = new Set([title.toLowerCase()]);
+  return works
+    .filter(w => { const t = (w.title||'').trim(); if (seen.has(t.toLowerCase())) return false; seen.add(t.toLowerCase()); return true; })
+    .map(w => ({
+      title:  w.title || '',
+      author: (w.authors || [])[0]?.name || '',
+      cover:  w.cover_id ? OL_COVER.replace('{id}', w.cover_id) : '',
+      url:    w.key ? 'https://openlibrary.org' + w.key : '',
+    }));
+}
+
+// ── Render results ──
+function renderResults(books) {
+  const el = document.getElementById('results');
+  if (!books.length) { el.innerHTML = '<p class="no-results">No results found.</p>'; return; }
+  el.innerHTML = books.map((b, i) => `
+    <div class="card">
+      ${b.cover ? `<img src="${esc(b.cover)}" alt="" onerror="this.style.display='none'">` : ''}
+      <div class="card-body">
+        <h3><a href="${esc(b.url)}" target="_blank">${esc(b.title)}</a></h3>
+        <p>${esc(b.author)}${b.year ? ' · ' + esc(b.year) : ''}</p>
+        ${b.rating ? `<p style="font-size:13px;color:#777;">⭐ ${esc(b.rating)}</p>` : ''}
+        <button class="toggle-btn" onclick="toggleRelated(${i}, ${JSON.stringify(esc(b.title))}, ${JSON.stringify(esc(b.author))}, this)">Related books ▾</button>
+        <div class="related-box" id="related-${i}" style="display:none;"></div>
+      </div>
+    </div>`).join('');
+}
+
+async function toggleRelated(i, title, author, btn) {
+  const box = document.getElementById('related-' + i);
+  if (box.style.display !== 'none') { box.style.display = 'none'; btn.textContent = 'Related books ▾'; return; }
+  box.style.display = 'block';
+  btn.textContent = 'Related books ▴';
+  if (box.dataset.loaded) return;
+  box.dataset.loaded = '1';
+  box.innerHTML = '<em style="color:#666">Loading…</em>';
+  try {
+    const books = await getRelated(title, author);
+    if (!books.length) { box.innerHTML = '<em style="color:#666">No related books found.</em>'; return; }
+    box.innerHTML = books.map(b => `
+      <div class="mini">
+        ${b.cover ? `<img src="${esc(b.cover)}" alt="" onerror="this.style.display='none'">` : ''}
+        <a href="${esc(b.url)}" target="_blank">${esc(b.title)}${b.author ? ' — ' + esc(b.author) : ''}</a>
+      </div>`).join('');
+  } catch(e) {
+    box.innerHTML = '<em style="color:#666">Failed to load related books.</em>';
+  }
+}
+
+// ── Search ──
+async function doSearch(q) {
+  const el = document.getElementById('results');
+  el.innerHTML = '<p class="spinner">Searching…</p>';
+  try {
+    const books = await olSearch(q);
+    renderResults(books);
+  } catch(e) {
+    el.innerHTML = '<p class="no-results">Search failed. Please try again.</p>';
+  }
+}
+
+// ── Autocomplete ──
+let acTimer = null, acSelected = -1, acItems = [];
+
+function hideDropdown() {
+  document.getElementById('acDropdown').style.display = 'none';
+  acSelected = -1; acItems = [];
+}
+
+async function fetchSuggestions(q) {
+  const params = new URLSearchParams({ q, limit: 5, fields: 'title,author_name' });
+  try {
+    const r = await fetch(OL_SEARCH + '?' + params);
+    const data = await r.json();
+    acItems = (data.docs || []).map(d => ({ title: d.title || '', author: (d.author_name||[])[0]||'' }));
+    acSelected = -1;
+    const drop = document.getElementById('acDropdown');
+    if (!acItems.length) { drop.style.display = 'none'; return; }
+    drop.innerHTML = acItems.map((item, i) =>
+      `<div class="ac-item" data-i="${i}">
+        <div class="ac-title">${esc(item.title)}</div>
+        <div class="ac-author">${esc(item.author)}</div>
+      </div>`).join('');
+    drop.querySelectorAll('.ac-item').forEach(d => {
+      d.addEventListener('mousedown', e => { e.preventDefault(); selectSuggestion(+d.dataset.i); });
+    });
+    drop.style.display = 'block';
+  } catch(e) { hideDropdown(); }
+}
+
+function selectSuggestion(i) {
+  if (!acItems[i]) return;
+  const input = document.getElementById('searchInput');
+  input.value = acItems[i].title;
+  hideDropdown();
+  triggerSearch(acItems[i].title);
+}
+
+function triggerSearch(q) {
+  q = q.trim();
+  if (!q) return;
+  setQuery(q);
+  doSearch(q);
+}
+
+// ── Event wiring ──
+const input = document.getElementById('searchInput');
+const clearBtn = document.getElementById('clearBtn');
+
+input.addEventListener('input', () => {
+  clearBtn.style.display = input.value ? 'block' : 'none';
+  clearTimeout(acTimer);
+  if (input.value.length < 3) { hideDropdown(); return; }
+  acTimer = setTimeout(() => fetchSuggestions(input.value), 300);
+});
+
+input.addEventListener('keydown', e => {
+  const drop = document.getElementById('acDropdown');
+  const divs = drop.querySelectorAll('.ac-item');
+  if (drop.style.display === 'none') return;
+  if (e.key === 'ArrowDown') { e.preventDefault(); acSelected = Math.min(acSelected+1, divs.length-1); divs.forEach((d,i) => d.classList.toggle('selected', i===acSelected)); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); acSelected = Math.max(acSelected-1, -1); divs.forEach((d,i) => d.classList.toggle('selected', i===acSelected)); }
+  else if (e.key === 'Enter' && acSelected >= 0) { e.preventDefault(); selectSuggestion(acSelected); }
+  else if (e.key === 'Escape') hideDropdown();
+});
+
+document.addEventListener('click', e => { if (!input.contains(e.target)) hideDropdown(); });
+
+clearBtn.addEventListener('click', () => {
+  input.value = ''; clearBtn.style.display = 'none';
+  hideDropdown();
+  document.getElementById('results').innerHTML = '';
+  history.pushState({}, '', location.pathname);
+  input.focus();
+});
+
+document.getElementById('searchForm').addEventListener('submit', e => {
+  e.preventDefault();
+  hideDropdown();
+  triggerSearch(input.value);
+});
+
+window.addEventListener('popstate', () => {
+  const q = getQuery();
+  input.value = q;
+  clearBtn.style.display = q ? 'block' : 'none';
+  if (q) doSearch(q); else document.getElementById('results').innerHTML = '';
+});
+
+// ── Init ──
+window.addEventListener('load', () => {
+  const q = getQuery();
+  if (q) { input.value = q; clearBtn.style.display = 'block'; doSearch(q); }
+  input.focus();
+});
+</script>
+</body>
+</html>
